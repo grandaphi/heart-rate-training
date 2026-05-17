@@ -37,6 +37,7 @@ body{height:100%;background:var(--bg);color:var(--text);font-family:var(--ui);fo
 .hdr-status{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:.62rem;color:var(--muted);}
 .sdot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0;}
 .sdot.ble{background:var(--green);box-shadow:0 0 6px #4caf5080;animation:blink 1.2s infinite;}
+.sdot.reconnecting{background:#ff9800;box-shadow:0 0 6px #ff980080;animation:blink 0.5s infinite;}
 .sdot.done{background:var(--green);}
 .sdot.err{background:var(--accent2);}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
@@ -588,17 +589,22 @@ document.getElementById('wakeLockBtn').addEventListener('click',async()=>{
 });
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible'){
-    // Re-acquire wake lock (it's automatically released when screen locks)
+    // Re-acquire wake lock (auto-released when screen locks)
     if(isRunning && document.getElementById('wakeToggle').checked) requestWakeLock();
-    // Sync elapsed from wall clock in case the timer was throttled
+    // Sync elapsed from wall clock in case the timer was throttled in background
     if(isRunning && sessionStartWall){
       elapsed=Math.round((Date.now()-sessionStartWall)/1000);
       const f=fmtS(elapsed);
       document.getElementById('m_elapsed').textContent=f;
       document.getElementById('d_elapsed').textContent=f;
     }
+    // If a reconnect is pending, retry immediately now that we're in foreground
+    // (gatt.connect() is more reliable when the app is visible)
+    if(isRunning && !bleConnected && !_intentionalDisconnect && bleDevice){
+      clearTimeout(_reconnectTimer);
+      doReconnect(_reconnectAttempts);
+    }
   } else {
-    // Screen going to background — wake lock will auto-release, just update UI
     updateWakeLockUI();
   }
 });
@@ -941,10 +947,16 @@ function rebuildCharts(){
 
 function setCD(id,data,labels){const c=charts[id];if(!c)return;c.data.labels=labels;c.data.datasets[0].data=data;c.update('none');}
 
-function getRecent(){const cut=elapsed-RECENT,s=hrData.filter(d=>d.t>=cut);return{data:s.map(d=>d.hr),labels:s.map(d=>d.t)};}
+function getRecent(){
+  const cut=elapsed-RECENT;
+  const s=hrData.filter(d=>d.t>=cut&&d.hr!==null);
+  return{data:s.map(d=>d.hr),labels:s.map(d=>d.t)};
+}
 
 function refreshCharts(){
-  const rec=getRecent(),allL=hrData.map(d=>d.t),allD=hrData.map(d=>d.hr);
+  const rec=getRecent();
+  const real=hrData.filter(d=>d.hr!==null);
+  const allL=real.map(d=>d.t),allD=real.map(d=>d.hr);
   ['Rm','Rd'].forEach(id=>{setCD('cv_'+id,rec.data,rec.labels);});
   ['Am','Ad'].forEach(id=>{setCD('cv_'+id,allD,allL);});
   ['SRm','SRd'].forEach(id=>{setCD('cv_'+id,rec.data,rec.labels);});
@@ -1041,7 +1053,8 @@ function pushHR(hr,t,rr=null){
   if(z){zoneEl.textContent=z.name;zoneEl.style.cssText=`background:${hexRgba(z.color,.18)};color:${z.color};border-color:${hexRgba(z.color,.4)}`;}
 
   // mobile stats
-  const hrs=hrData.map(d=>d.hr);
+  const hrs=hrData.filter(d=>d.hr!==null).map(d=>d.hr);
+  if(!hrs.length) return;
   const avg=Math.round(hrs.reduce((a,b)=>a+b,0)/hrs.length);
   document.getElementById('m_bpm').textContent=hr;
   document.getElementById('m_avg').textContent=avg;
@@ -1176,6 +1189,7 @@ async function connectBLE(){
   if(!navigator.bluetooth||!window.isSecureContext){checkBle();return;}
   document.getElementById('connectBleBtn').disabled=true;
   document.getElementById('bleErrorBox').classList.remove('show');
+  _intentionalDisconnect = false;   // fresh connect — allow auto-reconnect
   showBleOverlay();
   bleStep('Opening device picker…','Select your HRM from the list. Make sure the strap is on and awake — it needs to be advertising.');
   setStatus('','Scanning…');
@@ -1229,19 +1243,113 @@ async function connectBLE(){
 
 function onHRNote(e){const{hr,rr}=parseHRM(e.target.value);pushHR(hr,elapsed,rr.length?rr[rr.length-1]:null);}
 
+// ── AUTO-RECONNECT ──
+let _intentionalDisconnect = false;  // true when user manually disconnects
+let _reconnectAttempts     = 0;
+let _reconnectTimer        = null;
+const MAX_RECONNECT        = 6;
+const RECONNECT_DELAYS     = [2000, 3000, 5000, 8000, 12000, 15000]; // ms between attempts
+
 function onBleDisc(){
-  bleConnected=false;bleChar=null;hideBleOverlay();
+  bleConnected = false;
+  bleChar      = null;
+  hideBleOverlay();
   document.getElementById('bleConnectedBox').classList.remove('show');
-  if(isRunning){stopSession(false);showBleError('Device disconnected','The HRM dropped the connection. Tap Connect again to reconnect.');}
-  setStatus('err','Disconnected');
-  document.getElementById('connectBleBtn').disabled=false;
-  document.getElementById('disconnectBleBtn').disabled=true;
+  updateWakeLockUI();
+
+  if(isRunning && !_intentionalDisconnect){
+    // ── Unintentional drop: keep session alive, start auto-reconnect ──
+    setStatus('reconnecting', 'Connection lost — reconnecting…');
+    vibrate([200, 100, 200]);
+    showToast('⚠ Signal lost — reconnecting…');
+    // Record a gap marker in the data so the chart shows a break
+    hrData.push({ t: elapsed, hr: null, rr: null, gap: true });
+    _reconnectAttempts = 0;
+    scheduleReconnect();
+  } else {
+    // ── Intentional: user pressed Disconnect ──
+    document.getElementById('connectBleBtn').disabled  = false;
+    document.getElementById('disconnectBleBtn').disabled = true;
+    setStatus('', 'Disconnected');
+  }
+}
+
+function scheduleReconnect(){
+  clearTimeout(_reconnectTimer);
+  if(!isRunning || _intentionalDisconnect || !bleDevice) return;
+  if(_reconnectAttempts >= MAX_RECONNECT){
+    // Give up after max attempts
+    _reconnectAttempts = 0;
+    setStatus('err', 'Reconnect failed');
+    showBleError(
+      `Could not reconnect after ${MAX_RECONNECT} attempts`,
+      'Check the strap is still on and in range, then tap Connect HRM to try again manually.'
+    );
+    // Only stop the session now — data is preserved
+    stopSession(false);
+    document.getElementById('connectBleBtn').disabled = false;
+    return;
+  }
+  const delay = RECONNECT_DELAYS[Math.min(_reconnectAttempts, RECONNECT_DELAYS.length - 1)];
+  const attempt = _reconnectAttempts + 1;
+  setStatus('reconnecting', `Reconnecting… (${attempt}/${MAX_RECONNECT})`);
+  _reconnectTimer = setTimeout(()=> doReconnect(attempt), delay);
+}
+
+async function doReconnect(attempt){
+  if(!isRunning || _intentionalDisconnect || !bleDevice) return;
+  _reconnectAttempts = attempt;
+
+  try{
+    // Re-connect to the SAME device — no picker shown to user
+    bleServer = await bleDevice.gatt.connect();
+
+    // Re-acquire the characteristic
+    const svc  = await bleServer.getPrimaryService(GATT_HR);
+    bleChar    = await svc.getCharacteristic(GATT_HRC);
+    await bleChar.startNotifications();
+    bleChar.addEventListener('characteristicvaluechanged', onHRNote);
+
+    // ✅ Reconnected
+    bleConnected       = true;
+    _reconnectAttempts = 0;
+    clearTimeout(_reconnectTimer);
+
+    const name = bleDevice.name || 'HRM Device';
+    showBleConnected(name);
+    setStatus('ble', `Live · ${name}`);
+    SOUNDS.zone();
+    vibrate([100, 50, 300]);
+    showToast('✓ Reconnected — session continuing');
+
+    // Close any lingering error box from this reconnect cycle
+    document.getElementById('bleErrorBox').classList.remove('show');
+
+    // Re-acquire wake lock (was released when screen locked/disconnected)
+    requestWakeLock();
+
+  } catch(err){
+    // Failed — try again
+    scheduleReconnect();
+  }
 }
 
 async function disconnectBLE(){
-  if(bleChar){try{await bleChar.stopNotifications();}catch(_){}bleChar=null;}
-  if(bleDevice?.gatt?.connected)bleDevice.gatt.disconnect();
+  _intentionalDisconnect = true;   // signal: don't auto-reconnect
+  clearTimeout(_reconnectTimer);
+  _reconnectAttempts = 0;
+
+  if(bleChar){
+    try{ await bleChar.stopNotifications(); }catch(_){}
+    try{ bleChar.removeEventListener('characteristicvaluechanged', onHRNote); }catch(_){}
+    bleChar = null;
+  }
+  if(bleDevice?.gatt?.connected) bleDevice.gatt.disconnect();
+  // onBleDisc will fire and handle UI since _intentionalDisconnect=true
+
   document.getElementById('bleConnectedBox').classList.remove('show');
+  document.getElementById('connectBleBtn').disabled  = false;
+  document.getElementById('disconnectBleBtn').disabled = true;
 }
 
 // ── SESSION ──
@@ -1273,6 +1381,9 @@ function resetAll(){
   const zp=document.getElementById('hdrZone');zp.textContent='Not connected';zp.style.cssText='';
   firedMilestones = new Set();
   sessionStartWall = null;
+  _intentionalDisconnect = true;   // stop any pending reconnect loop
+  clearTimeout(_reconnectTimer);
+  _reconnectAttempts = 0;
   setStatus('','Idle');
   renderZoneCards();rebuildCharts();
   updateProgressStats();
